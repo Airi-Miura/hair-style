@@ -1,0 +1,8 @@
+streamlit>=1.45.0
+opencv-python>=4.9.0,<5.0.0
+mediapipe==0.10.14
+rembg>=2.0.57
+onnxruntime>=1.17.0
+Pillow>=10.0.0
+numpy>=1.26.0,<2.0.0
+torch>=2.2.0
