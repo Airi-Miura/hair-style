@@ -36,6 +36,13 @@ class FaceParsingResult:
     hair_overlay_preview: Image.Image
     hair_removed_rgba: Image.Image
     hair_area_ratio: float
+    raw_hair_mask: Image.Image
+    postprocessed_hair_mask: Image.Image
+    dilation_added_mask: Image.Image
+    color_assist_mask: Image.Image
+    final_hair_mask: Image.Image
+    hair_mask_bbox: tuple[int, int, int, int] | None
+    hair_mask_area_pixels: int
 
 
 def _lazy_import_torch() -> tuple[object, object]:
@@ -273,6 +280,150 @@ def _postprocess_hair_mask(raw_mask: np.ndarray) -> np.ndarray:
     return mask.astype(np.uint8)
 
 
+def _remove_small_components(mask: np.ndarray, min_area: int) -> np.ndarray:
+    """髪の細い毛先を残すため、かなり小さい孤立ノイズだけを除去する。"""
+    binary = (mask > 0).astype(np.uint8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    cleaned = np.zeros_like(binary, dtype=np.uint8)
+    for label in range(1, count):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area >= min_area:
+            cleaned[labels == label] = 255
+    return cleaned
+
+
+def _hair_mask_bbox(mask: np.ndarray, threshold: int = 80) -> tuple[int, int, int, int] | None:
+    """髪マスクの非ゼロ領域bboxを返す。"""
+    ys, xs = np.where(mask > threshold)
+    if len(xs) == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max() + 1), int(ys.max() + 1)
+
+
+def _safe_point(point: object, fallback: tuple[float, float]) -> tuple[float, float]:
+    """MediaPipe由来の点がない場合に安全な代替点を使う。"""
+    if isinstance(point, tuple) and len(point) == 2:
+        return float(point[0]), float(point[1])
+    return fallback
+
+
+def _estimate_face_roi(image_rgb: Image.Image) -> dict[str, float]:
+    """MediaPipeの顔位置から、髪補助検出に使う顔周辺ROIを作る。"""
+    width, height = image_rgb.size
+    default = {
+        "x1": width * 0.18,
+        "y1": height * 0.02,
+        "x2": width * 0.82,
+        "y2": height * 0.78,
+        "face_left": width * 0.35,
+        "face_right": width * 0.65,
+        "brow_y": height * 0.34,
+        "chin_y": height * 0.68,
+        "face_width": width * 0.30,
+        "face_height": height * 0.42,
+    }
+    try:
+        from face_detection import detect_face
+
+        face = detect_face(np.asarray(image_rgb.convert("RGB")))
+        left = _safe_point(face.left, (default["face_left"], height * 0.45))
+        right = _safe_point(face.right, (default["face_right"], height * 0.45))
+        chin = _safe_point(face.chin, (width * 0.5, default["chin_y"]))
+        top = _safe_point(face.top, (width * 0.5, height * 0.10))
+        brow = _safe_point(face.brow_center, (width * 0.5, default["brow_y"]))
+        face_width = max(1.0, abs(right[0] - left[0]))
+        face_height = max(1.0, abs(chin[1] - top[1]))
+        return {
+            "x1": max(0.0, left[0] - face_width * 0.55),
+            "y1": max(0.0, top[1] - face_height * 0.22),
+            "x2": min(float(width), right[0] + face_width * 0.55),
+            "y2": min(float(height), chin[1] + face_height * 0.18),
+            "face_left": left[0],
+            "face_right": right[0],
+            "brow_y": brow[1],
+            "chin_y": chin[1],
+            "face_width": face_width,
+            "face_height": face_height,
+        }
+    except Exception:
+        return default
+
+
+def _make_auxiliary_allowed_area(image_rgb: Image.Image) -> np.ndarray:
+    """顔中央を避け、左右外側と頭頂部だけを髪補助検出の対象にする。"""
+    width, height = image_rgb.size
+    roi = _estimate_face_roi(image_rgb)
+    yy, xx = np.indices((height, width))
+    in_roi = (xx >= roi["x1"]) & (xx <= roi["x2"]) & (yy >= roi["y1"]) & (yy <= roi["y2"])
+    side_margin = roi["face_width"] * 0.12
+    left_side = xx < (roi["face_left"] + side_margin)
+    right_side = xx > (roi["face_right"] - side_margin)
+    top_area = yy < (roi["brow_y"] - roi["face_height"] * 0.03)
+    below_chin_limit = yy <= (roi["chin_y"] + roi["face_height"] * 0.14)
+    allowed = in_roi & below_chin_limit & (left_side | right_side | top_area)
+    return allowed.astype(np.uint8) * 255
+
+
+def _dark_connected_hair_candidates(image_rgb: Image.Image, base_mask: np.ndarray) -> np.ndarray:
+    """既存髪マスクに接している暗色領域だけを髪候補として追加する。"""
+    rgb = np.asarray(image_rgb.convert("RGB"))
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+
+    allowed = _make_auxiliary_allowed_area(image_rgb)
+    near_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    near_hair = cv2.dilate((base_mask > 80).astype(np.uint8) * 255, near_kernel, iterations=3)
+    dark = ((gray < 105) & ((saturation > 18) | (value < 75))).astype(np.uint8) * 255
+    candidates = cv2.bitwise_and(dark, allowed)
+    candidates = cv2.bitwise_and(candidates, near_hair)
+    candidates = cv2.morphologyEx(candidates, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
+
+    count, labels, stats, _ = cv2.connectedComponentsWithStats((candidates > 0).astype(np.uint8), connectivity=8)
+    kept = np.zeros_like(candidates, dtype=np.uint8)
+    base_touch = cv2.dilate((base_mask > 80).astype(np.uint8) * 255, np.ones((3, 3), np.uint8), iterations=1)
+    min_area = max(8, int(candidates.size * 0.000006))
+    max_area = max(300, int(candidates.size * 0.075))
+    for label in range(1, count):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < min_area or area > max_area:
+            continue
+        component = labels == label
+        if np.any(base_touch[component] > 0) or np.any(near_hair[component] > 0):
+            kept[component] = 255
+    return kept
+
+
+def _postprocess_hair_mask(raw_mask: np.ndarray, image_rgb: Image.Image) -> dict[str, object]:
+    """髪マスクのノイズ除去、軽い膨張、暗色連結補助、境界フェザーを行う。"""
+    raw = (raw_mask > 0).astype(np.uint8) * 255
+    min_component_area = max(8, int(raw.size * 0.000006))
+    cleaned = _remove_small_components(raw, min_component_area)
+
+    kernel3 = np.ones((3, 3), np.uint8)
+    kernel5 = np.ones((5, 5), np.uint8)
+    closed = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel5, iterations=1)
+    dilated_binary = cv2.dilate(closed, kernel3, iterations=1)
+    dilation_added = cv2.subtract(dilated_binary, closed)
+
+    color_assist = _dark_connected_hair_candidates(image_rgb, dilated_binary)
+    combined_binary = np.maximum(dilated_binary, color_assist)
+    combined_binary = cv2.morphologyEx(combined_binary, cv2.MORPH_CLOSE, kernel3, iterations=1)
+
+    feathered = cv2.GaussianBlur(combined_binary, (5, 5), 0)
+    final = np.maximum(combined_binary, feathered).astype(np.uint8)
+    return {
+        "raw": raw,
+        "postprocessed": closed,
+        "dilation_added": dilation_added,
+        "color_assist": color_assist,
+        "final": final,
+        "bbox": _hair_mask_bbox(final),
+        "area_pixels": int(np.count_nonzero(final > 80)),
+    }
+
+
 def _class_map_to_color(class_map: np.ndarray) -> Image.Image:
     """Face Parsingのクラス分類結果をデバッグ用カラー画像へ変換する。"""
     palette = np.array(
@@ -333,7 +484,8 @@ def run_face_parsing(
 
         parsing = cv2.resize(parsing, (width, height), interpolation=cv2.INTER_NEAREST)
         raw_hair = (parsing == HAIR_CLASS_ID).astype(np.uint8)
-        hair_mask_array = _postprocess_hair_mask(raw_hair)
+        mask_debug = _postprocess_hair_mask(raw_hair, image_rgb)
+        hair_mask_array = mask_debug["final"]
         hair_area_ratio = float(np.count_nonzero(hair_mask_array > 80) / hair_mask_array.size)
 
         if hair_area_ratio < min_hair_ratio:
@@ -356,6 +508,13 @@ def run_face_parsing(
             hair_overlay_preview=overlay_preview,
             hair_removed_rgba=hair_removed,
             hair_area_ratio=hair_area_ratio,
+            raw_hair_mask=Image.fromarray(mask_debug["raw"], mode="L"),
+            postprocessed_hair_mask=Image.fromarray(mask_debug["postprocessed"], mode="L"),
+            dilation_added_mask=Image.fromarray(mask_debug["dilation_added"], mode="L"),
+            color_assist_mask=Image.fromarray(mask_debug["color_assist"], mode="L"),
+            final_hair_mask=hair_mask,
+            hair_mask_bbox=mask_debug["bbox"],
+            hair_mask_area_pixels=int(mask_debug["area_pixels"]),
         )
     except FaceParsingRuntimeError:
         raise

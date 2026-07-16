@@ -114,6 +114,15 @@ def _source_hair_mask_area(mask: Image.Image) -> float:
     return float(np.count_nonzero(mask_array > 80) / mask_array.size)
 
 
+def _mask_bbox(mask: Image.Image, threshold: int = 80) -> tuple[int, int, int, int] | None:
+    """デバッグ用にマスクの非透明領域bboxを返す。"""
+    mask_array = np.array(mask.convert("L"))
+    ys, xs = np.where(mask_array > threshold)
+    if len(xs) == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max() + 1), int(ys.max() + 1)
+
+
 def _process_image(image: Image.Image, input_hash: str) -> ProcessedData:
     """背景削除、Face Parsing、元髪透明化を入力画像単位で一度だけ実行する。"""
     resized = resize_if_large(image)
@@ -130,6 +139,8 @@ def _process_image(image: Image.Image, input_hash: str) -> ProcessedData:
         "input_image_hash": input_hash,
         "source_hair_mask_recomputed": True,
         "source_hair_mask_area": _source_hair_mask_area(parsing_result.hair_mask),
+        "source_hair_mask_bbox": parsing_result.hair_mask_bbox,
+        "source_hair_mask_area_pixels": parsing_result.hair_mask_area_pixels,
         "person_without_hair_process_id": datetime.now().strftime("%Y%m%d-%H%M%S-%f"),
     }
     return resized, normalized, cutout_rgba, cutout_on_white, parsing_result, person_without_hair_rgba, face_info, normalization
@@ -169,6 +180,24 @@ def _composed_hair_layers_preview(layers: dict[str, Image.Image]) -> Image.Image
     for name in ("hair_full", "side_left", "side_right", "front", "strands"):
         canvas.alpha_composite(layers[name].convert("RGBA"))
     return canvas.convert("RGB")
+
+
+def _hair_mask_debug_overlay(
+    base_image: Image.Image,
+    final_mask: Image.Image,
+    dilation_added: Image.Image,
+    color_assist: Image.Image,
+) -> Image.Image:
+    """膨張追加と色補助追加を色分けして確認するプレビューを作る。"""
+    base = base_image.convert("RGBA")
+    transparent = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    final_layer = Image.composite(Image.new("RGBA", base.size, (255, 0, 0, 75)), transparent, final_mask.convert("L"))
+    dilation_layer = Image.composite(Image.new("RGBA", base.size, (255, 220, 0, 150)), transparent, dilation_added.convert("L"))
+    color_layer = Image.composite(Image.new("RGBA", base.size, (0, 210, 255, 150)), transparent, color_assist.convert("L"))
+    preview = Image.alpha_composite(base, final_layer)
+    preview = Image.alpha_composite(preview, dilation_layer)
+    preview = Image.alpha_composite(preview, color_layer)
+    return preview.convert("RGB")
 
 
 def _render_camera_debug(snapshot: CameraSnapshot | None) -> None:
@@ -230,6 +259,15 @@ def _render_debug_view(
     """正規化、元髪マスク、髪型レイヤー、最終合成のデバッグ表示を行う。"""
     _render_camera_debug(camera_snapshot)
     _render_preprocess_meta(selected_name)
+    st.subheader("元髪マスク後処理デバッグ")
+    st.write(
+        {
+            "髪マスク面積px": parsing_result.hair_mask_area_pixels,
+            "髪マスク面積率": parsing_result.hair_area_ratio,
+            "髪マスクbbox": parsing_result.hair_mask_bbox or _mask_bbox(parsing_result.hair_mask),
+            "選択髪型名": selected_name,
+        }
+    )
     st.subheader("髪素材座標系デバッグ")
     st.write(
         {
@@ -245,6 +283,12 @@ def _render_debug_view(
     selected_hair_alpha = _combined_layer_alpha_image(composition.transformed_layers)
     selected_hair_preview = _composed_hair_layers_preview(composition.transformed_layers)
     person_without_hair_on_white = compose_on_white(person_without_hair_rgba)
+    hair_mask_addition_preview = _hair_mask_debug_overlay(
+        normalized,
+        parsing_result.hair_mask,
+        parsing_result.dilation_added_mask,
+        parsing_result.color_assist_mask,
+    )
     debug_items = [
         ("正規化前画像", original),
         ("撮影ガイドとのずれ", normalization.assessment.guide_overlay),
@@ -253,6 +297,11 @@ def _render_debug_view(
         ("背景削除後人物画像", cutout_on_white),
         ("背景削除後人物画像（RGBA確認）", compose_on_white(cutout_rgba)),
         ("Face Parsingのクラス分類画像", parsing_result.class_map),
+        ("Face Parsingの生髪マスク", parsing_result.raw_hair_mask),
+        ("後処理後の髪マスク", parsing_result.postprocessed_hair_mask),
+        ("膨張で追加された領域", parsing_result.dilation_added_mask),
+        ("色補助で追加された領域", parsing_result.color_assist_mask),
+        ("追加領域の色分けプレビュー", hair_mask_addition_preview),
         ("元画像から作成した髪領域マスク", parsing_result.hair_mask),
         ("髪領域の赤色プレビュー", parsing_result.hair_overlay_preview),
         ("元髪透明化済み人物画像", person_without_hair_on_white),
