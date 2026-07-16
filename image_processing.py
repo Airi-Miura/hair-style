@@ -61,6 +61,20 @@ def make_hair_area_transparent(person_rgba: Image.Image, hair_mask: Image.Image,
     return Image.fromarray(rgba_array, mode="RGBA")
 
 
+def create_person_without_hair(person_rgba: Image.Image, source_hair_mask: Image.Image) -> Image.Image:
+    """Face Parsingの髪マスクだけを使って、元髪を透明化した人物RGBAを作る。
+
+    髪型素材の種類、配置、サイズ、回転、アルファには一切依存させない。
+    入力画像と髪マスクが同じなら、常に同じ透明化結果になる。
+    """
+    rgba = person_rgba.convert("RGBA")
+    mask = source_hair_mask.convert("L").resize(rgba.size, Image.Resampling.BILINEAR)
+    rgba_array = np.array(rgba).astype(np.float32)
+    mask_alpha = np.array(mask).astype(np.float32) / 255.0
+    rgba_array[:, :, 3] *= 1.0 - mask_alpha
+    return Image.fromarray(np.clip(rgba_array, 0, 255).astype(np.uint8), mode="RGBA")
+
+
 def pil_to_rgb_array(image: Image.Image) -> np.ndarray:
     """Pillow画像をMediaPipeへ渡せるRGB配列へ変換する。"""
     return np.array(image.convert("RGB"))

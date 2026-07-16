@@ -347,9 +347,9 @@ def run_face_parsing(
         class_map = _class_map_to_color(parsing)
         overlay_preview = create_hair_overlay_preview(image_rgb, hair_mask)
 
-        from image_processing import make_hair_area_transparent
+        from image_processing import create_person_without_hair
 
-        hair_removed = make_hair_area_transparent(person_rgba, hair_mask)
+        hair_removed = create_person_without_hair(person_rgba, hair_mask)
         return FaceParsingResult(
             class_map=class_map,
             hair_mask=hair_mask,
